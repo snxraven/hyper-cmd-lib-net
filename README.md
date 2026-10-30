@@ -72,11 +72,23 @@ pipeTcpServer(remoteStream, leftoverBuffer, {
 protocol) that gets written to the local socket before piping starts. Pass `null` if
 there isn't any.
 
-#### UDP framing
+#### UDP datagrams
 
-UDP has no stream boundaries, so the two helpers below speak a small length-prefixed
-framing over the tunnel instead: 4 bytes big-endian length, then that many bytes of
-payload. They're meant to be run as a pair, one on each end of a tunnel.
+UDP datagrams are independent and loss-tolerant. These helpers carry each one as an
+unreliable message on the tunnel (`stream.trySend` / `stream.send` out, the `'message'`
+event back) instead of writing length-prefixed bytes onto the reliable stream. The
+reliable stream retransmits and congestion-controls, so one dropped packet would stall
+every datagram queued behind it. A HyperDHT secret stream already encrypts `trySend`.
+
+Datagrams are held until `stream.connected` becomes true (the noise handshake). A stream
+that never sets `connected` is treated as ready.
+
+#### `const capture = bufferUdpMessages(stream)`
+
+Start copying `'message'` payloads off `stream` immediately. Unreliable messages are not
+ordered with the reliable header, so they can arrive before that header has been parsed.
+Call `capture.stop()` once `pipeUdpFramedServer` is about to take over, and pass
+`capture.pending` as `opts.pending`.
 
 #### `const { proxySocket, clients } = createUdpFramedProxy(createTunnel, opts, onBind)`
 
@@ -96,25 +108,27 @@ createUdpFramedProxy(
 )
 ```
 
-`clients` is a `Map` of `address:port` -> `{ stream, rinfo, buffer }`. A frame bigger
+`clients` is a `Map` of `address:port` -> `{ stream, rinfo, sender }`. A datagram bigger
 than `maxFrameSize` destroys that client's tunnel and evicts it — the next packet from
 the same client just starts a new one.
 
 #### `pipeUdpFramedServer(stream, leftover, opts)`
 
-The other end of the pair. Unframes packets off `stream` and forwards them as plain
-UDP to a local service, framing replies back onto `stream`.
+The other end of the pair. Forwards each `'message'` as a plain UDP datagram to a local
+service, and sends replies back with `trySend`.
 
 ```js
 pipeUdpFramedServer(remoteStream, leftoverBuffer, {
   port: 53,
   host: '127.0.0.1',
-  maxFrameSize: 65535
+  maxFrameSize: 65535,
+  pending: [] // datagrams captured with bufferUdpMessages before this call
 })
 ```
 
-A clean `end` on `stream` ends the local socket, no drama. An `error`, or a frame over
-`maxFrameSize`, destroys it.
+`leftover` is bytes already read off the reliable stream with the tunnel header. When
+non-empty it is forwarded as one datagram. A clean `end` on `stream` ends the local
+socket. An `error`, or a datagram over `maxFrameSize`, destroys it.
 
 ## License
 

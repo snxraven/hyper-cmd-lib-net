@@ -1,87 +1,138 @@
 const test = require('brittle')
 const { pipeUdpFramedServer } = require('../lib/udp-framed.js')
-const { fakeSocket, createLogger, frame, tick, withEchoUdpServer } = require('./helpers.js')
+const { fakeSocket, createLogger, tick, withEchoUdpServer } = require('./helpers.js')
 
-test('pipeUdpFramedServer - forwards a framed message to the local service and frames the reply back', async function (t) {
+test('pipeUdpFramedServer - forwards a datagram to the local service and sends the reply back', async function (t) {
   await withEchoUdpServer(async (addr) => {
     const stream = fakeSocket()
     pipeUdpFramedServer(stream, null, { port: addr.port, host: '127.0.0.1' })
 
     const payload = Buffer.from('ping-udp-server')
-    stream.push(frame(payload))
+    stream.emit('message', payload)
     await tick(40)
 
-    t.is(stream.written.length, 1)
-    const reply = stream.written[0]
-    const len = reply.readUInt32BE(0)
-    t.is(len, payload.length)
-    t.alike(reply.subarray(4, 4 + len), payload)
+    t.is(stream.written.length, 0, 'reply is not written onto the reliable stream')
+    t.is(stream.messages.length, 1)
+    t.alike(stream.messages[0], payload)
 
     stream.emit('end')
     await tick()
   })
 })
 
-test('pipeUdpFramedServer - drains a complete frame already present in leftover', async function (t) {
+test('pipeUdpFramedServer - forwards leftover bytes as one datagram', async function (t) {
   await withEchoUdpServer(async (addr) => {
     const stream = fakeSocket()
     const payload = Buffer.from('leftover-complete')
-    pipeUdpFramedServer(stream, frame(payload), { port: addr.port, host: '127.0.0.1' })
+    pipeUdpFramedServer(stream, payload, { port: addr.port, host: '127.0.0.1' })
     await tick(40)
 
-    const reply = stream.written[0]
-    const len = reply.readUInt32BE(0)
-    t.alike(reply.subarray(4, 4 + len), payload)
+    t.alike(stream.messages[0], payload)
 
     stream.emit('end')
     await tick()
   })
 })
 
-test('pipeUdpFramedServer - reassembles a frame split across leftover and later stream data', async function (t) {
+test('pipeUdpFramedServer - delivers leftover and a later message as independent datagrams', async function (t) {
   await withEchoUdpServer(async (addr) => {
     const stream = fakeSocket()
-    const full = frame(Buffer.from('split-across-chunks'))
-    const partial = full.subarray(0, 6) // 4-byte length prefix + 2 payload bytes
-    const rest = full.subarray(6)
-
-    pipeUdpFramedServer(stream, partial, { port: addr.port, host: '127.0.0.1' })
-    await tick(20)
-    t.is(stream.written.length, 0, 'incomplete frame is not forwarded yet')
-
-    stream.push(rest)
+    pipeUdpFramedServer(stream, Buffer.from('from-leftover'), {
+      port: addr.port,
+      host: '127.0.0.1'
+    })
+    stream.emit('message', Buffer.from('from-message'))
     await tick(40)
 
-    const reply = stream.written[0]
-    const len = reply.readUInt32BE(0)
-    t.alike(reply.subarray(4, 4 + len), Buffer.from('split-across-chunks'))
+    const payloads = stream.messages.map((buf) => buf.toString()).sort()
+    t.alike(payloads, ['from-leftover', 'from-message'])
 
     stream.emit('end')
     await tick()
   })
 })
 
-test('pipeUdpFramedServer - handles back-to-back frames delivered in a single chunk', async function (t) {
+test('pipeUdpFramedServer - handles back-to-back messages', async function (t) {
   await withEchoUdpServer(async (addr) => {
     const stream = fakeSocket()
     pipeUdpFramedServer(stream, null, { port: addr.port, host: '127.0.0.1' })
 
-    const combined = Buffer.concat([frame(Buffer.from('one')), frame(Buffer.from('two'))])
-    stream.push(combined)
+    stream.emit('message', Buffer.from('one'))
+    stream.emit('message', Buffer.from('two'))
     await tick(40)
 
-    const payloads = stream.written.map((buf) => {
-      const len = buf.readUInt32BE(0)
-      return buf.subarray(4, 4 + len).toString()
-    })
-    t.alike(payloads.sort(), ['one', 'two'])
+    const payloads = stream.messages.map((buf) => buf.toString()).sort()
+    t.alike(payloads, ['one', 'two'])
 
     stream.emit('end')
     await tick()
   })
 })
 
-test('pipeUdpFramedServer - a frame over maxFrameSize destroys the stream with a descriptive error', async function (t) {
+test('pipeUdpFramedServer - replays datagrams captured before the pipe was attached', async function (t) {
+  await withEchoUdpServer(async (addr) => {
+    const stream = fakeSocket()
+    const pending = [Buffer.from('early'), Buffer.from('also-early')]
+    pipeUdpFramedServer(stream, null, { port: addr.port, host: '127.0.0.1', pending })
+    await tick(40)
+
+    const payloads = stream.messages.map((buf) => buf.toString()).sort()
+    t.alike(payloads, ['also-early', 'early'])
+
+    stream.emit('end')
+    await tick()
+  })
+})
+
+test('pipeUdpFramedServer - ignores bytes on the reliable stream', async function (t) {
+  await withEchoUdpServer(async (addr) => {
+    const stream = fakeSocket()
+    pipeUdpFramedServer(stream, null, { port: addr.port, host: '127.0.0.1' })
+
+    stream.push(Buffer.from('not-a-datagram'))
+    await tick(30)
+    t.is(stream.messages.length, 0)
+
+    stream.emit('message', Buffer.from('real'))
+    await tick(40)
+    t.alike(stream.messages[0], Buffer.from('real'))
+
+    stream.emit('end')
+    await tick()
+  })
+})
+
+test('pipeUdpFramedServer - holds local replies until the tunnel connects', async function (t) {
+  await withEchoUdpServer(async (addr) => {
+    const stream = fakeSocket()
+    stream.connected = false
+    stream.sentEarly = 0
+    const send = stream.trySend
+    stream.trySend = (buf) => {
+      if (stream.connected !== true) stream.sentEarly++
+      send(buf)
+    }
+
+    pipeUdpFramedServer(stream, null, { port: addr.port, host: '127.0.0.1' })
+    stream.emit('message', Buffer.from('ping'))
+    await tick(40)
+
+    t.is(stream.messages.length, 0)
+    t.is(stream.sentEarly, 0)
+
+    stream.connected = true
+    stream.emit('connect')
+    await tick(20)
+
+    t.alike(stream.messages[0], Buffer.from('ping'))
+    t.is(stream.sentEarly, 0)
+
+    stream.emit('end')
+    await tick()
+  })
+})
+
+test('pipeUdpFramedServer - a datagram over maxFrameSize destroys the stream with a descriptive error', async function (t) {
   const stream = fakeSocket()
   let err
   stream.on('error', (e) => {
@@ -89,11 +140,11 @@ test('pipeUdpFramedServer - a frame over maxFrameSize destroys the stream with a
   })
 
   pipeUdpFramedServer(stream, null, { port: 1, host: '127.0.0.1', maxFrameSize: 4 })
-  stream.push(frame(Buffer.from('too-big-payload')))
+  stream.emit('message', Buffer.from('too-big-payload'))
   await tick(30)
 
   t.ok(stream.destroyed)
-  t.ok(err && /Frame too large: 15 > 4/.test(err.message))
+  t.ok(err && /Datagram too large: 15 > 4/.test(err.message))
 })
 
 test('pipeUdpFramedServer - a remote stream error destroys the pipe', async function (t) {

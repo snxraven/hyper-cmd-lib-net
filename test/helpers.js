@@ -4,6 +4,7 @@ const dgram = require('dgram')
 
 function fakeSocket() {
   const written = []
+  const messages = []
   const s = new Duplex({
     read() {},
     write(chunk, cb) {
@@ -12,34 +13,27 @@ function fakeSocket() {
     }
   })
   s.written = written
+  s.messages = messages
+  s.trySend = (buf) => {
+    messages.push(Buffer.from(buf))
+  }
   return s
 }
 
 // A stream that echoes back whatever is written to it, simulating a remote
 // peer that reflects data (used as the "far end" of a tunnel/proxy).
 function echoStream() {
-  return new Duplex({
+  const s = new Duplex({
     read() {},
     write(chunk, cb) {
       this.push(chunk)
       cb(null)
     }
   })
-}
-
-// Similar to echoStream(), but pushes each write back in two separate chunks
-function splitEchoStream() {
-  return new Duplex({
-    read() {},
-    write(chunk, cb) {
-      const mid = Math.floor(chunk.length / 2) || 1
-      this.push(chunk.subarray(0, mid))
-      setImmediate(() => {
-        this.push(chunk.subarray(mid))
-        cb(null)
-      })
-    }
-  })
+  s.trySend = (buf) => {
+    s.emit('message', Buffer.from(buf))
+  }
+  return s
 }
 
 function createLogger() {
@@ -51,12 +45,6 @@ function createLogger() {
     error: (...a) => calls.error.push(a)
   }
   return { logger, calls }
-}
-
-function frame(payload) {
-  const len = Buffer.alloc(4)
-  len.writeUInt32BE(payload.length, 0)
-  return Buffer.concat([len, payload])
 }
 
 function tick(ms = 20) {
@@ -119,9 +107,7 @@ async function withEchoUdpServer(fn) {
 module.exports = {
   fakeSocket,
   echoStream,
-  splitEchoStream,
   createLogger,
-  frame,
   tick,
   bindUdpClient,
   listenTcp,

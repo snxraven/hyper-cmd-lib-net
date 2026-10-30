@@ -1,6 +1,6 @@
 const test = require('brittle')
 const { createUdpFramedProxy } = require('../lib/udp-framed.js')
-const { echoStream, splitEchoStream, createLogger, tick, bindUdpClient } = require('./helpers.js')
+const { echoStream, createLogger, tick, bindUdpClient } = require('./helpers.js')
 
 test('createUdpFramedProxy - round-trips a datagram through the tunnel factory', async function (t) {
   const proxy = createUdpFramedProxy(
@@ -82,7 +82,7 @@ test('createUdpFramedProxy - gives distinct clients independent tunnels and repl
   t.is(calls, 2)
 })
 
-test('createUdpFramedProxy - oversized reply frame destroys the tunnel and evicts the client', async function (t) {
+test('createUdpFramedProxy - oversized reply datagram destroys the tunnel and evicts the client', async function (t) {
   let calls = 0
   const { logger, calls: logs } = createLogger()
   const proxy = createUdpFramedProxy(
@@ -104,8 +104,8 @@ test('createUdpFramedProxy - oversized reply frame destroys the tunnel and evict
   client.send(oversized, 0, oversized.length, addr.port, '127.0.0.1')
   await tick(30)
 
-  t.is(proxy.clients.size, 0, 'client entry removed after oversized frame')
-  t.ok(logs.error.some((args) => /Frame too large/.test(args[0])))
+  t.is(proxy.clients.size, 0, 'client entry removed after oversized datagram')
+  t.ok(logs.error.some((args) => /Datagram too large/.test(args[0])))
 
   const small = Buffer.from('small')
   client.send(small, 0, small.length, addr.port, '127.0.0.1')
@@ -141,9 +141,13 @@ test('createUdpFramedProxy - removes the client entry when its tunnel closes', a
   t.is(proxy.clients.size, 0)
 })
 
-test('createUdpFramedProxy - reassembles a reply frame split across multiple stream chunks', async function (t) {
+test('createUdpFramedProxy - does not turn reliable stream bytes into datagrams', async function (t) {
+  let tunnel
   const proxy = createUdpFramedProxy(
-    () => splitEchoStream(),
+    () => {
+      tunnel = echoStream()
+      return tunnel
+    },
     { port: 0, host: '127.0.0.1' },
     () => {}
   )
@@ -154,9 +158,60 @@ test('createUdpFramedProxy - reassembles a reply frame split across multiple str
   const client = await bindUdpClient()
   t.teardown(() => client.close())
 
-  const reply = new Promise((resolve) => client.once('message', (msg) => resolve(msg.toString())))
-  const payload = Buffer.from('reassemble-me-please')
-  client.send(payload, 0, payload.length, addr.port, '127.0.0.1')
+  const received = []
+  client.on('message', (msg) => received.push(msg.toString()))
 
-  t.is(await reply, 'reassemble-me-please')
+  const payload = Buffer.from('only-this')
+  client.send(payload, 0, payload.length, addr.port, '127.0.0.1')
+  await tick(30)
+
+  tunnel.push(Buffer.from('should-not-leak'))
+  await tick(30)
+
+  t.alike(received, ['only-this'])
+})
+
+test('createUdpFramedProxy - holds datagrams until the tunnel connects', async function (t) {
+  let tunnel
+  const proxy = createUdpFramedProxy(
+    () => {
+      tunnel = echoStream()
+      tunnel.connected = false
+      const send = tunnel.trySend
+      tunnel.sentEarly = 0
+      tunnel.trySend = (buf) => {
+        if (tunnel.connected !== true) tunnel.sentEarly++
+        send(buf)
+      }
+      return tunnel
+    },
+    { port: 0, host: '127.0.0.1' },
+    () => {}
+  )
+  t.teardown(() => proxy.proxySocket.close())
+  await tick()
+
+  const addr = proxy.proxySocket.address()
+  const client = await bindUdpClient()
+  t.teardown(() => client.close())
+
+  let early = false
+  const reply = new Promise((resolve) => {
+    client.once('message', (msg) => {
+      if (!tunnel.connected) early = true
+      resolve(msg.toString())
+    })
+  })
+  const payload = Buffer.from('held')
+  client.send(payload, 0, payload.length, addr.port, '127.0.0.1')
+  await tick(30)
+
+  t.is(tunnel.sentEarly, 0)
+  t.absent(early)
+
+  tunnel.connected = true
+  tunnel.emit('connect')
+
+  t.is(await reply, 'held')
+  t.absent(early)
 })
